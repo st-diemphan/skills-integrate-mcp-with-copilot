@@ -1,0 +1,138 @@
+# Rollback Workflow
+# Manually trigger a rollback by specifying the environment and target image tag.
+# This deregisters the current task definition revision and forces ECS to use
+# the specified (older) image, then waits for service stability.
+
+name: Rollback
+
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: "Target environment to roll back"
+        required: true
+        type: choice
+        options:
+          - dev
+          - stg
+          - prod
+      image_tag:
+        description: "ECR image tag to roll back to (e.g. prod-abc1234)"
+        required: true
+        type: string
+      reason:
+        description: "Reason for rollback (logged in summary)"
+        required: false
+        type: string
+
+# Only one rollback at a time per environment
+concurrency:
+  group: rollback-${{ inputs.environment }}
+  cancel-in-progress: false
+
+env:
+  AWS_REGION: us-east-1
+  ECR_REGISTRY: ${{ vars.ECR_REGISTRY }}
+  IMAGE_NAME: mergington-api
+
+jobs:
+  rollback:
+    name: Rollback ${{ inputs.environment }} → ${{ inputs.image_tag }}
+    runs-on: ubuntu-latest
+    environment: ${{ inputs.environment }}
+    permissions:
+      id-token: write
+      contents: read
+
+    steps:
+      - name: Log rollback intent
+        run: |
+          echo "🔄 Rollback initiated"
+          echo "  Environment : ${{ inputs.environment }}"
+          echo "  Image tag   : ${{ inputs.image_tag }}"
+          echo "  Reason      : ${{ inputs.reason || 'not provided' }}"
+          echo "  Triggered by: ${{ github.actor }}"
+
+      # ── Resolve environment-specific values ───────────────────────────────
+      - name: Resolve environment config
+        id: env
+        run: |
+          case "${{ inputs.environment }}" in
+            prod)
+              echo "ecs_cluster=prod-cluster" >> "$GITHUB_OUTPUT"
+              echo "ecs_service=prod-api"     >> "$GITHUB_OUTPUT"
+              echo "task_definition=prod-api" >> "$GITHUB_OUTPUT"
+              echo "aws_role=${{ vars.AWS_ROLE_PROD }}" >> "$GITHUB_OUTPUT"
+              ;;
+            stg)
+              echo "ecs_cluster=stg-cluster"  >> "$GITHUB_OUTPUT"
+              echo "ecs_service=stg-api"      >> "$GITHUB_OUTPUT"
+              echo "task_definition=stg-api"  >> "$GITHUB_OUTPUT"
+              echo "aws_role=${{ vars.AWS_ROLE_STG }}"  >> "$GITHUB_OUTPUT"
+              ;;
+            dev)
+              echo "ecs_cluster=dev-cluster"  >> "$GITHUB_OUTPUT"
+              echo "ecs_service=dev-api"      >> "$GITHUB_OUTPUT"
+              echo "task_definition=dev-api"  >> "$GITHUB_OUTPUT"
+              echo "aws_role=${{ vars.AWS_ROLE_DEV }}"  >> "$GITHUB_OUTPUT"
+              ;;
+          esac
+
+      # ── Authenticate to AWS using OIDC ────────────────────────────────────
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ steps.env.outputs.aws_role }}
+          aws-region:     ${{ env.AWS_REGION }}
+
+      # ── Fetch current task definition and swap the image ──────────────────
+      - name: Render rollback task definition
+        id: task-def
+        run: |
+          IMAGE_URI="${ECR_REGISTRY}/${IMAGE_NAME}:${{ inputs.image_tag }}"
+
+          aws ecs describe-task-definition \
+            --task-definition "${{ steps.env.outputs.task_definition }}" \
+            --query taskDefinition \
+            > current-task-def.json
+
+          # Replace the image URI using jq (pass name as --arg to avoid quoting issues)
+          jq --arg img "${IMAGE_URI}" --arg name "${IMAGE_NAME}" \
+            '(.containerDefinitions[] | select(.name == $name) | .image) = $img' \
+            current-task-def.json > rollback-task-def.json
+
+          # Register the updated task definition
+          NEW_REVISION=$(aws ecs register-task-definition \
+            --cli-input-json file://rollback-task-def.json \
+            --query "taskDefinition.taskDefinitionArn" \
+            --output text)
+
+          echo "new_revision=${NEW_REVISION}" >> "$GITHUB_OUTPUT"
+          echo "image_uri=${IMAGE_URI}"       >> "$GITHUB_OUTPUT"
+
+      # ── Force a new deployment with the rolled-back task definition ────────
+      - name: Force ECS service update
+        run: |
+          aws ecs update-service \
+            --cluster "${{ steps.env.outputs.ecs_cluster }}" \
+            --service "${{ steps.env.outputs.ecs_service }}" \
+            --task-definition "${{ steps.task-def.outputs.new_revision }}" \
+            --force-new-deployment
+
+      # ── Wait for service stability ────────────────────────────────────────
+      - name: Wait for service stability
+        run: |
+          aws ecs wait services-stable \
+            --cluster "${{ steps.env.outputs.ecs_cluster }}" \
+            --services "${{ steps.env.outputs.ecs_service }}"
+
+      # ── Summary ───────────────────────────────────────────────────────────
+      - name: Rollback summary
+        run: |
+          echo "✅ Rollback to ${{ inputs.image_tag }} on ${{ inputs.environment }} succeeded."
+          echo ""
+          aws ecs describe-services \
+            --cluster "${{ steps.env.outputs.ecs_cluster }}" \
+            --services "${{ steps.env.outputs.ecs_service }}" \
+            --query "services[0].{Status:status,Running:runningCount,Desired:desiredCount,TaskDef:taskDefinition}" \
+            --output table

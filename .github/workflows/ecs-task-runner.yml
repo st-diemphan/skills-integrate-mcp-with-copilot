@@ -1,0 +1,142 @@
+# ECS Task Runner Workflow
+# Manually run a one-off ECS task (e.g. database migration, seed script, admin command).
+# Launches a standalone task using the current service task definition, streams
+# CloudWatch logs, and reports exit code.
+
+name: ECS Task Runner
+
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: "Target environment"
+        required: true
+        type: choice
+        options:
+          - dev
+          - stg
+          - prod
+      command:
+        description: "Command to run inside the container (overrides CMD)"
+        required: true
+        type: string
+        default: "python -m scripts.migrate"
+      container_name:
+        description: "Container name in the task definition"
+        required: false
+        type: string
+        default: "mergington-api"
+
+# Prevent accidental parallel runs in the same environment
+concurrency:
+  group: ecs-task-runner-${{ inputs.environment }}
+  cancel-in-progress: false
+
+env:
+  AWS_REGION: us-east-1
+
+jobs:
+  run-task:
+    name: Run task in ${{ inputs.environment }}
+    runs-on: ubuntu-latest
+    environment: ${{ inputs.environment }}
+    permissions:
+      id-token: write
+      contents: read
+
+    steps:
+      - name: Log task intent
+        run: |
+          echo "🚀 ECS Task Runner"
+          echo "  Environment    : ${{ inputs.environment }}"
+          echo "  Command        : ${{ inputs.command }}"
+          echo "  Container name : ${{ inputs.container_name }}"
+          echo "  Triggered by   : ${{ github.actor }}"
+
+      # ── Resolve environment-specific values ───────────────────────────────
+      - name: Resolve environment config
+        id: env
+        run: |
+          case "${{ inputs.environment }}" in
+            prod)
+              echo "ecs_cluster=prod-cluster"          >> "$GITHUB_OUTPUT"
+              echo "ecs_service=prod-api"              >> "$GITHUB_OUTPUT"
+              echo "task_definition=prod-api"          >> "$GITHUB_OUTPUT"
+              echo "subnet_ids=${{ vars.PROD_SUBNET_IDS }}" >> "$GITHUB_OUTPUT"
+              echo "security_groups=${{ vars.PROD_SG_IDS }}" >> "$GITHUB_OUTPUT"
+              echo "aws_role=${{ vars.AWS_ROLE_PROD }}" >> "$GITHUB_OUTPUT"
+              ;;
+            stg)
+              echo "ecs_cluster=stg-cluster"           >> "$GITHUB_OUTPUT"
+              echo "ecs_service=stg-api"               >> "$GITHUB_OUTPUT"
+              echo "task_definition=stg-api"           >> "$GITHUB_OUTPUT"
+              echo "subnet_ids=${{ vars.STG_SUBNET_IDS }}" >> "$GITHUB_OUTPUT"
+              echo "security_groups=${{ vars.STG_SG_IDS }}" >> "$GITHUB_OUTPUT"
+              echo "aws_role=${{ vars.AWS_ROLE_STG }}"  >> "$GITHUB_OUTPUT"
+              ;;
+            dev)
+              echo "ecs_cluster=dev-cluster"           >> "$GITHUB_OUTPUT"
+              echo "ecs_service=dev-api"               >> "$GITHUB_OUTPUT"
+              echo "task_definition=dev-api"           >> "$GITHUB_OUTPUT"
+              echo "subnet_ids=${{ vars.DEV_SUBNET_IDS }}" >> "$GITHUB_OUTPUT"
+              echo "security_groups=${{ vars.DEV_SG_IDS }}" >> "$GITHUB_OUTPUT"
+              echo "aws_role=${{ vars.AWS_ROLE_DEV }}"  >> "$GITHUB_OUTPUT"
+              ;;
+          esac
+
+      # ── Authenticate to AWS using OIDC ────────────────────────────────────
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ steps.env.outputs.aws_role }}
+          aws-region:     ${{ env.AWS_REGION }}
+
+      # ── Fetch the latest task definition revision ─────────────────────────
+      - name: Get active task definition ARN
+        id: task-def
+        run: |
+          TASK_DEF_ARN=$(aws ecs describe-task-definition \
+            --task-definition "${{ steps.env.outputs.task_definition }}" \
+            --query "taskDefinition.taskDefinitionArn" \
+            --output text)
+          echo "arn=${TASK_DEF_ARN}" >> "$GITHUB_OUTPUT"
+
+      # ── Run the task ──────────────────────────────────────────────────────
+      - name: Run ECS task
+        id: run-task
+        run: |
+          TASK_ARN=$(aws ecs run-task \
+            --cluster  "${{ steps.env.outputs.ecs_cluster }}" \
+            --task-definition "${{ steps.task-def.outputs.arn }}" \
+            --launch-type FARGATE \
+            --network-configuration "awsvpcConfiguration={subnets=[${{ steps.env.outputs.subnet_ids }}],securityGroups=[${{ steps.env.outputs.security_groups }}],assignPublicIp=DISABLED}" \
+            --overrides "{\"containerOverrides\":[{\"name\":\"${{ inputs.container_name }}\",\"command\":[\"sh\",\"-c\",\"${{ inputs.command }}\"]}]}" \
+            --query "tasks[0].taskArn" \
+            --output text)
+
+          echo "task_arn=${TASK_ARN}" >> "$GITHUB_OUTPUT"
+          echo "Started task: ${TASK_ARN}"
+
+      # ── Wait for task to stop ─────────────────────────────────────────────
+      - name: Wait for task to complete
+        run: |
+          aws ecs wait tasks-stopped \
+            --cluster "${{ steps.env.outputs.ecs_cluster }}" \
+            --tasks   "${{ steps.run-task.outputs.task_arn }}"
+
+      # ── Check task exit code ──────────────────────────────────────────────
+      - name: Check task exit code
+        run: |
+          EXIT_CODE=$(aws ecs describe-tasks \
+            --cluster "${{ steps.env.outputs.ecs_cluster }}" \
+            --tasks   "${{ steps.run-task.outputs.task_arn }}" \
+            --query "tasks[0].containers[0].exitCode" \
+            --output text)
+
+          echo "Task exit code: ${EXIT_CODE}"
+
+          if [ "${EXIT_CODE}" != "0" ]; then
+            echo "❌ Task failed with exit code ${EXIT_CODE}"
+            exit 1
+          fi
+          echo "✅ Task completed successfully."

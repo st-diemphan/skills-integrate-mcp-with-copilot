@@ -1,0 +1,144 @@
+# Terraform Plan Workflow
+# Runs `terraform plan` on every pull request that touches infrastructure code.
+# Posts the plan output as a PR comment so reviewers can see what will change.
+# Uses GitHub OIDC – no long-lived AWS credentials needed.
+
+name: Terraform Plan
+
+on:
+  pull_request:
+    paths:
+      - "terraform/**"
+      - ".github/workflows/terraform-plan.yml"
+
+# One plan per PR; cancel old ones when a new push arrives
+concurrency:
+  group: terraform-plan-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+env:
+  AWS_REGION:   us-east-1
+  TF_VERSION:   "1.8.0"
+  TF_WORK_DIR:  terraform/
+
+jobs:
+  plan:
+    name: Terraform Plan
+    runs-on: ubuntu-latest
+    permissions:
+      id-token:      write   # OIDC token
+      contents:      read
+      pull-requests: write   # Post plan comment
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      # ── Authenticate to AWS using OIDC ────────────────────────────────────
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_ROLE_TERRAFORM }}
+          aws-region:     ${{ env.AWS_REGION }}
+
+      # ── Setup Terraform ───────────────────────────────────────────────────
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+
+      # ── Cache Terraform providers ─────────────────────────────────────────
+      - name: Cache Terraform providers
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.TF_WORK_DIR }}/.terraform
+          key: terraform-${{ hashFiles(format('{0}/.terraform.lock.hcl', env.TF_WORK_DIR)) }}
+          restore-keys: terraform-
+
+      # ── Terraform init ────────────────────────────────────────────────────
+      - name: Terraform Init
+        working-directory: ${{ env.TF_WORK_DIR }}
+        run: terraform init -input=false
+
+      # ── Terraform validate ────────────────────────────────────────────────
+      - name: Terraform Validate
+        working-directory: ${{ env.TF_WORK_DIR }}
+        run: terraform validate
+
+      # ── Terraform plan ────────────────────────────────────────────────────
+      - name: Terraform Plan
+        id: plan
+        working-directory: ${{ env.TF_WORK_DIR }}
+        # Continue on error so the comment step always runs
+        continue-on-error: true
+        run: |
+          terraform plan \
+            -input=false \
+            -no-color \
+            -out=tfplan.binary \
+            2>&1 | tee plan-output.txt
+
+          echo "exit_code=${PIPESTATUS[0]}" >> "$GITHUB_OUTPUT"
+
+      # ── Post plan output as PR comment ────────────────────────────────────
+      - name: Post plan as PR comment
+        uses: actions/github-script@v7
+        env:
+          PLAN_EXIT_CODE: ${{ steps.plan.outputs.exit_code }}
+        with:
+          script: |
+            const fs = require('fs');
+            const planOutput = fs.readFileSync('${{ env.TF_WORK_DIR }}/plan-output.txt', 'utf8');
+            const maxLen = 60000;  // GitHub comment character limit
+            const truncated = planOutput.length > maxLen
+              ? planOutput.slice(0, maxLen) + '\n\n... (truncated)'
+              : planOutput;
+
+            const exitCode = process.env.PLAN_EXIT_CODE;
+            const statusIcon = exitCode === '0' ? '✅' : (exitCode === '2' ? '📋' : '❌');
+            const statusText = exitCode === '0' ? 'No changes'
+              : exitCode === '2' ? 'Changes pending'
+              : 'Plan FAILED';
+
+            const body = [
+              `## ${statusIcon} Terraform Plan – ${statusText}`,
+              '',
+              '<details><summary>Show Plan</summary>',
+              '',
+              '```hcl',
+              truncated,
+              '```',
+              '</details>',
+              '',
+              `*Triggered by @${context.actor} on \`${{ github.head_ref }}\`*`,
+            ].join('\n');
+
+            // Delete previous bot comments to avoid clutter
+            const { data: comments } = await github.rest.issues.listComments({
+              owner: context.repo.owner,
+              repo:  context.repo.repo,
+              issue_number: context.issue.number,
+            });
+            for (const comment of comments) {
+              if (comment.user.type === 'Bot' && comment.body.includes('Terraform Plan')) {
+                await github.rest.issues.deleteComment({
+                  owner: context.repo.owner,
+                  repo:  context.repo.repo,
+                  comment_id: comment.id,
+                });
+              }
+            }
+
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo:  context.repo.repo,
+              issue_number: context.issue.number,
+              body,
+            });
+
+      # ── Fail if plan errored ──────────────────────────────────────────────
+      - name: Check plan status
+        if: steps.plan.outputs.exit_code != '0' && steps.plan.outputs.exit_code != '2'
+        run: |
+          echo "❌ Terraform plan failed with exit code ${{ steps.plan.outputs.exit_code }}"
+          exit 1

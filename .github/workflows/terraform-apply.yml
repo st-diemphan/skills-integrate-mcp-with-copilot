@@ -1,0 +1,97 @@
+# Terraform Apply Workflow
+# Runs `terraform apply` automatically when changes are merged to main.
+# Only applies the infrastructure changes; does NOT build or deploy the app
+# (that is handled by the CD workflow).
+# Uses GitHub OIDC – no long-lived AWS credentials needed.
+
+name: Terraform Apply
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - "terraform/**"
+      - ".github/workflows/terraform-apply.yml"
+
+# Only one apply at a time – queue, do not cancel
+concurrency:
+  group: terraform-apply
+  cancel-in-progress: false
+
+env:
+  AWS_REGION:  us-east-1
+  TF_VERSION:  "1.8.0"
+  TF_WORK_DIR: terraform/
+
+jobs:
+  apply:
+    name: Terraform Apply (main)
+    runs-on: ubuntu-latest
+    environment: prod   # Requires manual approval if configured in repo settings
+    permissions:
+      id-token: write   # OIDC token
+      contents: read
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      # ── Authenticate to AWS using OIDC ────────────────────────────────────
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_ROLE_TERRAFORM }}
+          aws-region:     ${{ env.AWS_REGION }}
+
+      # ── Setup Terraform ───────────────────────────────────────────────────
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+
+      # ── Cache Terraform providers ─────────────────────────────────────────
+      - name: Cache Terraform providers
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.TF_WORK_DIR }}/.terraform
+          key: terraform-${{ hashFiles(format('{0}/.terraform.lock.hcl', env.TF_WORK_DIR)) }}
+          restore-keys: terraform-
+
+      # ── Terraform init ────────────────────────────────────────────────────
+      - name: Terraform Init
+        working-directory: ${{ env.TF_WORK_DIR }}
+        run: terraform init -input=false
+
+      # ── Terraform validate ────────────────────────────────────────────────
+      - name: Terraform Validate
+        working-directory: ${{ env.TF_WORK_DIR }}
+        run: terraform validate
+
+      # ── Terraform plan (saved artifact) ──────────────────────────────────
+      - name: Terraform Plan
+        working-directory: ${{ env.TF_WORK_DIR }}
+        run: |
+          terraform plan \
+            -input=false \
+            -no-color \
+            -out=tfplan.binary
+
+      # ── Terraform apply ───────────────────────────────────────────────────
+      - name: Terraform Apply
+        working-directory: ${{ env.TF_WORK_DIR }}
+        run: terraform apply -input=false -auto-approve tfplan.binary
+
+      # ── Capture outputs ───────────────────────────────────────────────────
+      - name: Show Terraform outputs
+        working-directory: ${{ env.TF_WORK_DIR }}
+        run: terraform output -no-color
+
+      # ── Summary ───────────────────────────────────────────────────────────
+      - name: Write job summary
+        run: |
+          echo "## ✅ Terraform Apply Succeeded" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "- **Branch**: \`main\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "- **Commit**: \`${{ github.sha }}\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "- **Applied by**: @${{ github.actor }}" >> "$GITHUB_STEP_SUMMARY"
