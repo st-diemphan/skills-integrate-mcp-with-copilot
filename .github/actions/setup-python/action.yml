@@ -1,0 +1,56 @@
+# Reusable composite action – Setup Python environment
+# Sets up Python with pip dependency caching and installs requirements.
+# Optionally installs dev/quality tools (linters, type checkers, test runner).
+#
+# Usage:
+#   - uses: ./.github/actions/setup-python
+#     with:
+#       python-version: "3.11"
+#       install-dev-tools: "true"
+
+name: Setup Python Environment
+description: >
+  Sets up Python with pip caching, installs requirements.txt,
+  and optionally installs dev/quality tools.
+
+inputs:
+  python-version:
+    description: Python version to use
+    required: false
+    default: "3.11"
+  requirements-file:
+    description: Path to requirements file
+    required: false
+    default: requirements.txt
+  install-dev-tools:
+    description: Install lint/test/type-check tools (flake8, mypy, pytest, httpx)
+    required: false
+    default: "false"
+
+outputs:
+  python-version:
+    description: The actual Python version that was set up
+    value: ${{ steps.setup.outputs.python-version }}
+
+runs:
+  using: composite
+  steps:
+    - name: Set up Python ${{ inputs.python-version }}
+      id: setup
+      uses: actions/setup-python@v5
+      with:
+        python-version: ${{ inputs.python-version }}
+        cache: pip
+
+    - name: Upgrade pip
+      shell: bash
+      run: python -m pip install --upgrade pip
+
+    - name: Install application dependencies
+      shell: bash
+      run: pip install -r ${{ inputs.requirements-file }}
+
+    - name: Install dev tools
+      if: inputs.install-dev-tools == 'true'
+      shell: bash
+      run: pip install flake8 mypy pytest httpx

@@ -1,0 +1,120 @@
+# Scheduled Workflow Example
+# Demonstrates cron-triggered workflows for routine maintenance tasks:
+#   - Nightly health check against all environments
+#   - Weekly dependency audit
+#
+# Cron syntax quick reference (all times UTC):
+#   ┌───────────── minute  (0-59)
+#   │ ┌─────────── hour    (0-23)
+#   │ │ ┌───────── day     (1-31)
+#   │ │ │ ┌─────── month   (1-12)
+#   │ │ │ │ ┌───── day-of-week (0-6, 0=Sun)
+#   │ │ │ │ │
+#   * * * * *
+
+name: Scheduled Tasks
+
+on:
+  schedule:
+    # Nightly health check – every day at 02:00 UTC
+    - cron: "0 2 * * *"
+    # Weekly dependency audit – every Monday at 06:00 UTC
+    - cron: "0 6 * * 1"
+
+  # Allow manual trigger for ad-hoc runs
+  workflow_dispatch:
+    inputs:
+      task:
+        description: "Which scheduled task to run"
+        required: true
+        type: choice
+        options:
+          - health-check
+          - dependency-audit
+
+jobs:
+  # ── Nightly health check ────────────────────────────────────────────────
+  health-check:
+    name: Nightly health check
+    # Run when manually selected, or when triggered by the 02:00 cron schedule
+    if: >-
+      (github.event_name == 'workflow_dispatch' && inputs.task == 'health-check')
+      || (github.event_name == 'schedule' && github.event.schedule == '0 2 * * *')
+    runs-on: ubuntu-latest
+
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - env: dev
+            url: ${{ vars.DEV_APP_URL }}
+          - env: stg
+            url: ${{ vars.STG_APP_URL }}
+          - env: prod
+            url: ${{ vars.PROD_APP_URL }}
+
+    steps:
+      - name: Health check – ${{ matrix.env }}
+        run: |
+          HTTP_STATUS=$(curl -s -o /dev/null -w "%{http_code}" \
+            --max-time 10 \
+            "${{ matrix.url }}/activities")
+
+          echo "HTTP status for ${{ matrix.env }}: ${HTTP_STATUS}"
+
+          if [ "${HTTP_STATUS}" != "200" ]; then
+            echo "❌ Health check FAILED for ${{ matrix.env }} (status=${HTTP_STATUS})"
+            exit 1
+          fi
+          echo "✅ Health check PASSED for ${{ matrix.env }}"
+
+  # ── Weekly dependency audit ─────────────────────────────────────────────
+  dependency-audit:
+    name: Weekly dependency audit
+    # Run when manually selected, or when triggered by the Monday 06:00 cron schedule
+    if: >-
+      (github.event_name == 'workflow_dispatch' && inputs.task == 'dependency-audit')
+      || (github.event_name == 'schedule' && github.event.schedule == '0 6 * * 1')
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install pip-audit safety
+
+      # Audit using pip-audit (checks PyPI advisory database)
+      - name: Run pip-audit
+        run: pip-audit -r requirements.txt --output json --output-file audit-report.json || true
+
+      - name: Run safety check
+        run: safety check -r requirements.txt --output json > safety-report.json || true
+
+      - name: Upload audit reports
+        uses: actions/upload-artifact@v4
+        with:
+          name: dependency-audit-${{ github.run_id }}
+          path: |
+            audit-report.json
+            safety-report.json
+          retention-days: 30
+
+      - name: Summarize findings
+        run: |
+          echo "## Dependency Audit Summary" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          if [ -s audit-report.json ]; then
+            VULN_COUNT=$(python -c "import json,sys; d=json.load(open('audit-report.json')); print(len(d.get('vulnerabilities',[])))" 2>/dev/null || echo "unknown")
+            echo "- pip-audit found **${VULN_COUNT}** vulnerabilities" >> "$GITHUB_STEP_SUMMARY"
+          fi
+          echo "- Full reports available as workflow artifacts." >> "$GITHUB_STEP_SUMMARY"

@@ -1,0 +1,191 @@
+# CD Workflow
+# Deploys the application to AWS ECS based on the branch that was pushed:
+#   develop → DEV environment
+#   staging → STG environment
+#   main    → PROD environment
+#
+# Authentication: GitHub OIDC (no long-lived AWS credentials stored in secrets).
+# Deployment:     Rolling update via ECS service update → wait for stability.
+
+name: CD
+
+on:
+  push:
+    branches:
+      - main
+      - develop
+      - staging
+
+# Prevent concurrent deploys to the same environment
+concurrency:
+  group: cd-${{ github.ref_name }}
+  cancel-in-progress: false   # queue rather than cancel – safety first
+
+env:
+  AWS_REGION: us-east-1
+  ECR_REGISTRY: ${{ vars.ECR_REGISTRY }}   # e.g. 123456789012.dkr.ecr.us-east-1.amazonaws.com
+  IMAGE_NAME: mergington-api
+
+jobs:
+  # ── Resolve environment metadata ──────────────────────────────────────────
+  resolve-env:
+    name: Resolve deployment environment
+    runs-on: ubuntu-latest
+    outputs:
+      env_name:        ${{ steps.map.outputs.env_name }}
+      ecs_cluster:     ${{ steps.map.outputs.ecs_cluster }}
+      ecs_service:     ${{ steps.map.outputs.ecs_service }}
+      task_definition: ${{ steps.map.outputs.task_definition }}
+      aws_role:        ${{ steps.map.outputs.aws_role }}
+    steps:
+      - name: Map branch → environment
+        id: map
+        run: |
+          case "${{ github.ref_name }}" in
+            main)
+              echo "env_name=prod"           >> "$GITHUB_OUTPUT"
+              echo "ecs_cluster=prod-cluster" >> "$GITHUB_OUTPUT"
+              echo "ecs_service=prod-api"     >> "$GITHUB_OUTPUT"
+              echo "task_definition=prod-api" >> "$GITHUB_OUTPUT"
+              echo "aws_role=${{ vars.AWS_ROLE_PROD }}" >> "$GITHUB_OUTPUT"
+              ;;
+            staging)
+              echo "env_name=stg"            >> "$GITHUB_OUTPUT"
+              echo "ecs_cluster=stg-cluster"  >> "$GITHUB_OUTPUT"
+              echo "ecs_service=stg-api"      >> "$GITHUB_OUTPUT"
+              echo "task_definition=stg-api"  >> "$GITHUB_OUTPUT"
+              echo "aws_role=${{ vars.AWS_ROLE_STG }}"  >> "$GITHUB_OUTPUT"
+              ;;
+            develop)
+              echo "env_name=dev"            >> "$GITHUB_OUTPUT"
+              echo "ecs_cluster=dev-cluster"  >> "$GITHUB_OUTPUT"
+              echo "ecs_service=dev-api"      >> "$GITHUB_OUTPUT"
+              echo "task_definition=dev-api"  >> "$GITHUB_OUTPUT"
+              echo "aws_role=${{ vars.AWS_ROLE_DEV }}"  >> "$GITHUB_OUTPUT"
+              ;;
+          esac
+
+  # ── Build & push Docker image to ECR ──────────────────────────────────────
+  build-and-push:
+    name: Build & push to ECR (${{ needs.resolve-env.outputs.env_name }})
+    runs-on: ubuntu-latest
+    needs: resolve-env
+    environment: ${{ needs.resolve-env.outputs.env_name }}
+    permissions:
+      id-token: write   # Required for OIDC token exchange
+      contents: read
+
+    outputs:
+      image_uri: ${{ steps.push.outputs.image_uri }}
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      # ── Validate required secrets/vars are present ───────────────────────
+      - name: Validate configuration
+        run: |
+          : "${ECR_REGISTRY:?ECR_REGISTRY variable is not set}"
+          : "${AWS_REGION:?AWS_REGION is not set}"
+          echo "Configuration validated."
+
+      # ── Authenticate to AWS using OIDC (no static credentials) ───────────
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ needs.resolve-env.outputs.aws_role }}
+          aws-region:     ${{ env.AWS_REGION }}
+
+      # ── Log in to Amazon ECR ──────────────────────────────────────────────
+      - name: Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      # ── Build, tag, and push the image ────────────────────────────────────
+      - name: Build, tag & push image
+        id: push
+        env:
+          ENV_NAME: ${{ needs.resolve-env.outputs.env_name }}
+        run: |
+          IMAGE_URI="${ECR_REGISTRY}/${IMAGE_NAME}:${ENV_NAME}-${{ github.sha }}"
+          LATEST_URI="${ECR_REGISTRY}/${IMAGE_NAME}:${ENV_NAME}-latest"
+
+          docker build \
+            --tag "${IMAGE_URI}" \
+            --tag "${LATEST_URI}" \
+            --label "git.sha=${{ github.sha }}" \
+            --label "git.ref=${{ github.ref_name }}" \
+            --label "env=${ENV_NAME}" \
+            .
+
+          docker push "${IMAGE_URI}"
+          docker push "${LATEST_URI}"
+
+          echo "image_uri=${IMAGE_URI}" >> "$GITHUB_OUTPUT"
+
+  # ── Deploy to ECS ──────────────────────────────────────────────────────────
+  deploy:
+    name: Deploy to ECS (${{ needs.resolve-env.outputs.env_name }})
+    runs-on: ubuntu-latest
+    needs: [resolve-env, build-and-push]
+    environment: ${{ needs.resolve-env.outputs.env_name }}
+    permissions:
+      id-token: write
+      contents: read
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      # ── Authenticate to AWS using OIDC ────────────────────────────────────
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ needs.resolve-env.outputs.aws_role }}
+          aws-region:     ${{ env.AWS_REGION }}
+
+      # ── Download current task definition from ECS ─────────────────────────
+      - name: Download task definition
+        id: download-task-def
+        env:
+          TASK_DEF: ${{ needs.resolve-env.outputs.task_definition }}
+        run: |
+          aws ecs describe-task-definition \
+            --task-definition "${TASK_DEF}" \
+            --query taskDefinition \
+            > task-definition.json
+          echo "task_def_file=task-definition.json" >> "$GITHUB_OUTPUT"
+
+      # ── Inject new image URI into the task definition ─────────────────────
+      - name: Render new ECS task definition
+        id: task-def
+        uses: aws-actions/amazon-ecs-render-task-definition@v1
+        with:
+          task-definition: task-definition.json
+          container-name:  ${{ env.IMAGE_NAME }}
+          image:           ${{ needs.build-and-push.outputs.image_uri }}
+
+      # ── Register & deploy the updated task definition ─────────────────────
+      - name: Deploy to ECS (rolling update)
+        uses: aws-actions/amazon-ecs-deploy-task-definition@v2
+        with:
+          task-definition: ${{ steps.task-def.outputs.task-definition }}
+          service:         ${{ needs.resolve-env.outputs.ecs_service }}
+          cluster:         ${{ needs.resolve-env.outputs.ecs_cluster }}
+          # Wait until the service reaches steady state before marking success
+          wait-for-service-stability: true
+
+      # ── Print deployment summary ──────────────────────────────────────────
+      - name: Deployment status
+        env:
+          ENV_NAME:    ${{ needs.resolve-env.outputs.env_name }}
+          ECS_SERVICE: ${{ needs.resolve-env.outputs.ecs_service }}
+          ECS_CLUSTER: ${{ needs.resolve-env.outputs.ecs_cluster }}
+        run: |
+          echo "✅ Deployment to ${ENV_NAME} completed successfully."
+          echo ""
+          aws ecs describe-services \
+            --cluster  "${ECS_CLUSTER}" \
+            --services "${ECS_SERVICE}" \
+            --query "services[0].{Status:status,Running:runningCount,Desired:desiredCount,TaskDef:taskDefinition}" \
+            --output table
